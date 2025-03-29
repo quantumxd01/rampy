@@ -1,0 +1,219 @@
+import asyncio
+import os
+import json
+import logging
+from telethon import TelegramClient, events
+from telethon.errors import UserDeactivatedBanError, FloodWaitError
+from telethon.tl.functions.messages import GetHistoryRequest
+from colorama import init, Fore
+import pyfiglet
+import gc
+import psutil
+import sys
+
+# Initialize colorama for Windows support
+init(strip=not sys.stdout.isatty(), autoreset=True)
+
+CREDENTIALS_FOLDER = 'sessions'
+os.makedirs(CREDENTIALS_FOLDER, exist_ok=True)
+
+# Configure logging to also print to the console
+logging.basicConfig(
+    filename='og_flame_service.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+console = logging.StreamHandler(sys.stdout)
+console.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+console.setFormatter(formatter)
+logging.getLogger().addHandler(console)
+
+AUTO_REPLY_MESSAGE = """
+𝙄𝙩𝙨 𝙖𝙙 𝙖𝙘𝙘𝙤𝙪𝙣𝙩 𝙬𝙤𝙧𝙠𝙞𝙣𝙜 𝙛𝙤𝙧 @quantumsera .. 𝙙𝙢 @quantumsera 𝙛𝙤𝙧 𝙙𝙚𝙖𝙡𝙨!
+"""
+
+def display_banner():
+    print(Fore.RED + pyfiglet.figlet_format("Og_Flame"))
+    print(Fore.GREEN + "Made by @Og_Flame\n")
+
+def save_credentials(session_name, credentials):
+    path = os.path.join(CREDENTIALS_FOLDER, f"{session_name}.json")
+    with open(path, "w") as f:
+        json.dump(credentials, f)
+
+def load_credentials(session_name):
+    path = os.path.join(CREDENTIALS_FOLDER, f"{session_name}.json")
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return {}
+
+def clean_memory(tag=""):
+    gc.collect()
+    process = psutil.Process(os.getpid())
+    mem = process.memory_info().rss / (1024 * 1024)
+    print(Fore.MAGENTA + f"[{tag}] RAM usage: {mem:.2f} MB after GC")
+
+async def get_last_saved_message(client):
+    try:
+        saved_messages_peer = await client.get_input_entity('me')
+        history = await client(GetHistoryRequest(
+            peer=saved_messages_peer,
+            limit=1,
+            offset_id=0,
+            offset_date=None,
+            add_offset=0,
+            max_id=0,
+            min_id=0,
+            hash=0
+        ))
+        return history.messages[0] if history.messages else None
+    except Exception as e:
+        logging.error(f"Failed to retrieve saved messages: {str(e)}")
+        return None
+
+async def forward_messages_to_groups(client, session_name, rounds, delay_between_rounds):
+    """Forward the last saved message to all groups, clean memory and reconnect per round."""
+    for round_num in range(1, rounds + 1):
+        try:
+            print(Fore.YELLOW + f"\n[Session: {session_name}] Round {round_num} starting...")
+
+            # Reconnect to reset state
+            if not client.is_connected():
+                await client.connect()
+
+            last_message = await get_last_saved_message(client)
+            if not last_message:
+                print(Fore.RED + f"No saved message found for session {session_name}")
+                continue
+
+            dialogs = await client.get_dialogs()
+            group_dialogs = [dialog for dialog in dialogs if dialog.is_group]
+
+            if not group_dialogs:
+                print(Fore.RED + f"No groups found in session {session_name}")
+                continue
+
+            for dialog in group_dialogs:
+                group = dialog.entity
+                try:
+                    await client.forward_messages(group, last_message)
+                    print(Fore.GREEN + f"Forwarded to {group.title}")
+                except FloodWaitError as e:
+                    print(Fore.RED + f"FloodWait: Sleeping {e.seconds}s")
+                    await asyncio.sleep(e.seconds)
+                    await client.forward_messages(group, last_message)
+                except Exception as e:
+                    print(Fore.RED + f"Failed to forward to {group.title}: {str(e)}")
+
+            print(Fore.GREEN + f"[Session: {session_name}] Round {round_num} completed.")
+
+            # Clean up
+            await client.disconnect()
+            del dialogs, group_dialogs, last_message
+            clean_memory(f"{session_name} - Round {round_num}")
+
+            if round_num < rounds:
+                print(Fore.CYAN + f"Sleeping {delay_between_rounds}s before next round...")
+                await asyncio.sleep(delay_between_rounds)
+
+        except Exception as e:
+            print(Fore.RED + f"[{session_name}] Error during round {round_num}: {str(e)}")
+
+async def setup_auto_reply(client, session_name):
+    @client.on(events.NewMessage(incoming=True))
+    async def handler(event):
+        if event.is_private:
+            try:
+                await event.reply(AUTO_REPLY_MESSAGE)
+                print(Fore.GREEN + f"Replied to {event.sender_id} in session {session_name}")
+                logging.info(f"Replied to {event.sender_id} in session {session_name}")
+            except FloodWaitError as e:
+                await asyncio.sleep(e.seconds)
+                await event.reply(AUTO_REPLY_MESSAGE)
+            except Exception as e:
+                logging.error(f"Reply failed: {str(e)}")
+
+async def main():
+    display_banner()
+
+    try:
+        num_sessions = int(input("Enter the number of sessions: "))
+        if num_sessions <= 0:
+            print(Fore.RED + "Number of sessions must be > 0.")
+            return
+
+        valid_clients = []
+
+        for i in range(1, num_sessions + 1):
+            session_name = f"session{i}"
+            credentials = load_credentials(session_name)
+
+            if credentials:
+                api_id = credentials["api_id"]
+                api_hash = credentials["api_hash"]
+                phone_number = credentials["phone_number"]
+            else:
+                api_id = int(input(Fore.CYAN + f"API ID for session {i}: "))
+                api_hash = input(Fore.CYAN + f"API hash for session {i}: ")
+                phone_number = input(Fore.CYAN + f"Phone number for session {i}: ")
+                credentials = {
+                    "api_id": api_id,
+                    "api_hash": api_hash,
+                    "phone_number": phone_number,
+                }
+                save_credentials(session_name, credentials)
+
+            client = TelegramClient(session_name, api_id, api_hash)
+
+            try:
+                await client.start(phone=phone_number)
+                print(Fore.GREEN + f"Logged in session {i}")
+                valid_clients.append(client)
+            except UserDeactivatedBanError:
+                print(Fore.RED + f"Session {i} is banned.")
+                logging.warning(f"Session {i} is banned.")
+            except Exception as e:
+                print(Fore.RED + f"Login failed session {i}: {str(e)}")
+                logging.error(f"Login failed session {i}: {str(e)}")
+
+        if not valid_clients:
+            print(Fore.RED + "No valid clients.")
+            return
+
+        print(Fore.MAGENTA + "\nChoose an option:")
+        print(Fore.YELLOW + "1. Auto Forwarding")
+        print(Fore.YELLOW + "2. Auto Reply")
+
+        option = int(input(Fore.CYAN + "Enter your choice: "))
+
+        if option == 1:
+            rounds = int(input(Fore.MAGENTA + "Number of rounds? "))
+            delay_between_rounds = int(input(Fore.MAGENTA + "Delay between rounds (seconds)? "))
+
+            for client in valid_clients:
+                await setup_auto_reply(client, client.session.filename)
+
+            tasks = [
+                forward_messages_to_groups(client, client.session.filename, rounds, delay_between_rounds)
+                for client in valid_clients
+            ]
+            await asyncio.gather(*tasks)
+
+        elif option == 2:
+            print(Fore.GREEN + "Starting Auto Reply...")
+            for client in valid_clients:
+                await setup_auto_reply(client, client.session.filename)
+            await asyncio.gather(*(client.run_until_disconnected() for client in valid_clients))
+
+        for client in valid_clients:
+            await client.disconnect()
+
+    except KeyboardInterrupt:
+        print(Fore.YELLOW + "\nStopped by user.")
+    except Exception as e:
+        logging.error(f"Main Error: {str(e)}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
